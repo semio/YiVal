@@ -7,10 +7,17 @@ the model's responses to determine the quality or correctness of a given
 experiment result.
 """
 import copy
+import logging
 import string
 from typing import Any, Dict, Iterable, List, Optional, Union
 
-from ..common.model_utils import llm_completion
+# for exponential backoff
+import openai
+from tenacity import before_sleep_log, retry, stop_after_attempt, wait_random
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from ..schemas.evaluator_config import (
     EvaluatorOutput,
     EvaluatorType,
@@ -19,7 +26,6 @@ from ..schemas.evaluator_config import (
     OpenAIPromptBasedEvaluatorConfig,
 )
 from ..schemas.experiment_config import ExperimentResult, InputData, MultimodalOutput
-from ..schemas.model_configs import Request
 from .base_evaluator import BaseEvaluator
 
 CLASSIFY_STR = """
@@ -93,6 +99,16 @@ def format_template(
     return res
 
 
+@retry(
+    wait=wait_random(min=1, max=20),
+    stop=stop_after_attempt(100),
+    before_sleep=before_sleep_log(logger, logging.DEBUG)
+)
+def completion_with_backpff(**kwargs):
+    response = openai.ChatCompletion.create(**kwargs)
+    return response
+
+
 def choices_to_string(choice_strings: Iterable[str]) -> str:
     """Converts a list of choices into a formatted string."""
     return " or ".join(f'"{choice}"' for choice in choice_strings)
@@ -122,21 +138,20 @@ class OpenAIPromptBasedEvaluator(BaseEvaluator):
         prompt[-1]["content"] += "\n\n" + CLASSIFY_STR.format(
             choices=choices_to_string(self.config.choices)
         )
-
-        response = llm_completion(
-            Request(
-                model_name=self.config.model_name,
-                prompt=prompt,
-                params={"temperature": 0.0}
-            )
-        ).output
+        response = completion_with_backpff(
+            model="gpt-4",
+            messages=prompt,
+            temperature=0.5,
+            n=1,
+            max_tokens=1000,
+            request_timeout=60,
+        )
+        #response = openai.ChatCompletion.create(model="gpt-4", messages=prompt, temperature=0.5)
         response_content = response['choices'][0]['message']['content']
-
         choice = extract_choice_from_response(
             response_content, self.config.choices
         )
         score = calculate_choice_score(choice, self.config.choice_scores)
-
         return EvaluatorOutput(
             name=self.config.name,
             result=score if score is not None else choice,
