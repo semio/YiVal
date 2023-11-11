@@ -12,7 +12,7 @@ import string
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 # for exponential backoff
-import openai
+import litellm
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_random
 
 logging.basicConfig(level=logging.INFO)
@@ -105,7 +105,8 @@ def format_template(
     before_sleep=before_sleep_log(logger, logging.DEBUG)
 )
 def completion_with_backpff(**kwargs):
-    response = openai.ChatCompletion.create(**kwargs)
+    # response = openai.ChatCompletion.create(**kwargs)
+    response = litellm.completion(**kwargs)
     return response
 
 
@@ -141,10 +142,11 @@ class OpenAIPromptBasedEvaluator(BaseEvaluator):
         response = completion_with_backpff(
             model="gpt-4",
             messages=prompt,
-            temperature=0.5,
+            temperature=0.0,
             n=1,
             max_tokens=1000,
             request_timeout=60,
+            caching=True,
         )
         #response = openai.ChatCompletion.create(model="gpt-4", messages=prompt, temperature=0.5)
         response_content = response['choices'][0]['message']['content']
