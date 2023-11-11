@@ -63,13 +63,13 @@ class ExperimentRunner:
         processor = DataProcessor(self.config["dataset"])  # type: ignore
         data_batches = list(processor.process_data())
         sum([len(batch) for batch in data_batches]) * len(all_combinations)
-        semaphore = asyncio.Semaphore(20)
+        semaphore = asyncio.Semaphore(1)
         total_tasks = sum([len(batch)
                            for batch in data_batches]) * len(all_combinations)
         if "custom_function" not in self.config or not self.config[  # type: ignore
             "custom_function"]:
             return []
-        rate_limiter = common.RateLimiter(100 / 60, 10000)
+        rate_limiter = common.RateLimiter(20 / 60, 3000)
 
         async def eval_fn_with_semaphore(data_point):
             async with semaphore:
@@ -115,7 +115,7 @@ class ExperimentRunner:
             with tqdm(
                 total=total_combinations, desc="Processing", unit="item"
             ) as pbar:
-                with ThreadPoolExecutor(max_workers=10) as executor:
+                with ThreadPoolExecutor(max_workers=2) as executor:
                     for res in executor.map(
                         self.parallel_task, data,
                         [all_combinations] * len(data), [logger] * len(data),
@@ -140,7 +140,7 @@ class ExperimentRunner:
 
     def parallel_task(self, data_point, all_combinations, logger, evaluator):
         """Task to be run in parallel for processing data points."""
-        RateLimiter(1000 / 60)()  # Ensure rate limit
+        RateLimiter(100 / 60)()  # Ensure rate limit
         return run_single_input(
             data_point,
             self.config,
