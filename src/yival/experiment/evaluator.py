@@ -44,15 +44,16 @@ class Evaluator:
     ):
         self.configs = configs
 
-    def evaluate_individual_result(
+    async def evaluate_individual_result(
         self, result: ExperimentResult
     ) -> List[EvaluatorOutput]:
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # tasks = [evaluate_config(config, result) for config in self.configs]
+        # return await asyncio.gather(*tasks)
+        with ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(evaluate_config, config, result)
                 for config in self.configs
             ]
-
         # Gather results, filter out None results
         return [
             future.result() for future in futures

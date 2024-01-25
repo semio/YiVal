@@ -1,13 +1,17 @@
 # type: ignore
 
 import ast
+import asyncio
 import base64
 import hashlib
 import io
 import json
 import os
 import re
+import socket
+import subprocess
 import textwrap
+import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -19,18 +23,16 @@ import pandas as pd  # type: ignore
 import plotly.express as px  # type: ignore
 from dash import dash_table, dcc, html  # type: ignore
 from dash.dependencies import ALL, MATCH, Input, Output, State
+from dash.exceptions import PreventUpdate
 from dash_dangerously_set_inner_html import DangerouslySetInnerHTML
 from PIL import Image
 from pyngrok import ngrok
+from termcolor import colored
 
-from yival.experiment.rate_limiter import RateLimiter
-from yival.experiment.utils import (
-    call_function_from_string,
-    generate_experiment,
-    get_function_args,
-    run_single_input,
-)
-from yival.schemas.experiment_config import (
+from ...auto_prompt.default_task import DefaultValueProvider
+from ...common.auto_cofig_utils import auto_generate_config
+from ...schemas.common_structures import InputData
+from ...schemas.experiment_config import (
     CombinationAggregatedMetrics,
     EvaluatorOutput,
     Experiment,
@@ -39,8 +41,13 @@ from yival.schemas.experiment_config import (
     GroupedExperimentResult,
     MultimodalOutput,
 )
-
-from ...schemas.common_structures import InputData
+from ..rate_limiter import RateLimiter
+from ..utils import (
+    call_function_from_string,
+    generate_experiment,
+    get_function_args,
+    run_single_input,
+)
 from .hexagram import HEXAGRAMS, generate_hexagram_figure
 from .utils import (
     generate_group_key_combination_data,
@@ -290,7 +297,7 @@ def df_to_table(df):
 def create_dash_app(
     experiment_data: Experiment, experiment_config: ExperimentConfig,
     function_args: Dict[str, Any], all_combinations, state, logger, evaluator,
-    interactive_mode
+    interactive_mode, autogen, demo, enhance_page
 ):
 
     def parallel_task(data_point, all_combinations, logger, evaluator):
@@ -318,53 +325,60 @@ def create_dash_app(
         return None
 
     def generate_navigation():
-        return dbc.NavbarSimple(
-            children=[
-                dbc.NavItem(
-                    dbc.NavLink(
-                        "Experiment Results Analysis",
-                        href="/experiment-results"
-                    )
-                ),
-                dbc.NavItem(
-                    dbc.NavLink(
-                        "Detailed Experiment Results", href="/group-key-combo"
-                    )
-                ),
-                dbc.NavItem(
-                    dbc.NavLink(
-                        "Enhancer Experiment Results Analysis",
-                        href="/enhancer-experiment-results"
-                    )
-                ),
-                dbc.NavItem(
-                    dbc.NavLink(
-                        "Enhancer Detailed Experiment Results",
-                        href="/enhancer-group-key-combo"
-                    )
-                ),
-                dbc.NavItem(
-                    dbc.Button(
-                        "Export Data",
-                        id="export-btn",
-                        color="primary",
-                        className="ml-2"
-                    )
-                ),
+
+        children_list = [
+            dbc.NavItem(
+                dbc.NavLink(
+                    "Experiment Results Analysis", href="/experiment-results"
+                )
+            ),
+            dbc.NavItem(
+                dbc.NavLink(
+                    "Detailed Experiment Results", href="/group-key-combo"
+                )
+            ),
+            dbc.NavItem(
+                dbc.NavLink(
+                    "Enhancer Experiment Results Analysis",
+                    href="/enhancer-experiment-results"
+                )
+            ),
+            dbc.NavItem(
+                dbc.NavLink(
+                    "Enhancer Detailed Experiment Results",
+                    href="/enhancer-group-key-combo"
+                )
+            ),
+            dbc.NavItem(
+                dbc.Button(
+                    "Export Data",
+                    id="export-btn",
+                    color="primary",
+                    className="ml-2"
+                )
+            ),
+            dbc.NavItem(dbc.NavLink(
+                "Playground",
+                href="/interactive",
+            )),
+            dbc.NavItem(dbc.NavLink("Data Analysis", href="/data-analysis")),
+            dbc.NavItem(
+                dbc.NavLink(
+                    "Use Best Combinations",
+                    href="/use-best-result",
+                )
+            ),
+        ]
+        if autogen:
+            children_list.insert(
+                0,
                 dbc.NavItem(dbc.NavLink(
-                    "Playground",
-                    href="/interactive",
-                )),
-                dbc.NavItem(
-                    dbc.NavLink("Data Analysis", href="/data-analysis")
-                ),
-                dbc.NavItem(
-                    dbc.NavLink(
-                        "Use Best Combinations",
-                        href="/use-best-result",
-                    )
-                ),
-            ],
+                    "Create Task",
+                    href="/create-task",
+                ))
+            )
+        return dbc.NavbarSimple(
+            children=children_list,
             brand="YiVal",
             brand_href="/",
             color="primary",
@@ -385,7 +399,7 @@ def create_dash_app(
         data = []
         for metric in combo_metrics:
             row = {
-                "Hyperparameters":
+                "Prompt Variations":
                 "\n".join(
                     textwrap.wrap(
                         str(metric.combo_key).replace('"',
@@ -396,7 +410,9 @@ def create_dash_app(
 
             for k, v in metric.aggregated_metrics.items():
                 row[k] = ', '.join([f"{m.name}: {m.value}" for m in v])
-            row['Average Token Usage'] = str(metric.average_token_usage)
+            row['Average Token Usage(Cost Proportional)'] = str(
+                metric.average_token_usage
+            )
             row['Average Latency'] = str(metric.average_latency)
 
             if metric.combine_evaluator_outputs:
@@ -455,9 +471,9 @@ def create_dash_app(
         column_order = ["Iteration"
                         ] + [col for col in df if col != "Iteration"]
         df = df[column_order]
-        if 'Average Token Usage' in df:
-            df['Average Token Usage'] = pd.to_numeric(
-                df['Average Token Usage'], errors='coerce'
+        if 'Average Token Usage(Cost Proportional)' in df:
+            df['Average Token Usage(Cost Proportional)'] = pd.to_numeric(
+                df['Average Token Usage(Cost Proportional)'], errors='coerce'
             )
         if 'Average Latency' in df:
             df['Average Latency'] = pd.to_numeric(
@@ -466,6 +482,8 @@ def create_dash_app(
         return df
 
     def experiment_results_layout():
+        if not experiment_data.combination_aggregated_metrics:
+            return html.Div([html.H3("No Experiment Result data available.")])
 
         df = generate_combo_metrics_data(
             experiment_data.combination_aggregated_metrics,
@@ -537,6 +555,9 @@ def create_dash_app(
         ])
 
     def data_analysis_layout():
+        if not experiment_data.combination_aggregated_metrics:
+            return html.Div([html.H3("No Experiment Result data available.")])
+
         return html.Div([
             html.H3("Data Analysis", style={'textAlign': 'center'}),
             analysis_layout(df),
@@ -563,6 +584,9 @@ def create_dash_app(
         ])
 
     def combo_page_layout():
+        if not experiment_data.combination_aggregated_metrics:
+            return html.Div([html.H3("No Experiment Result data available.")])
+
         return html.Div([
             html.H3(
                 "Detailed Experiment Results", style={'textAlign': 'center'}
@@ -608,6 +632,13 @@ def create_dash_app(
                 "Enhancer Experiment Results Analysis",
                 style={'textAlign': 'center'}
             ),
+            html.P(
+                "*Note: iteration 0 is the user task input, other iterations are YiVal autotune results.",
+                style={
+                    'textAlign': 'center',
+                    'color': 'grey'
+                }
+            ),
             combo_aggregated_metrics_layout(df_enhancer),
             html.Hr(),
             generate_legend(),
@@ -633,9 +664,12 @@ def create_dash_app(
         ])
 
     def analysis_layout(df):
+        if not experiment_data.combination_aggregated_metrics:
+            return html.Div([html.H3("No Experiment Result data available.")])
+
         evaluator_outputs = [
             col for col in df.columns
-            if (col != 'Hyperparameters' and 'Sample' not in col)
+            if (col != 'Prompt Variations' and 'Sample' not in col)
         ]
         return html.Div([
             html.Div([
@@ -672,6 +706,7 @@ def create_dash_app(
     def enhancer_combo_page_layout():
         if not experiment_data.enhancer_output:
             return html.Div([html.H3("No Enhancer Output data available.")])
+
         return html.Div([
             html.H3(
                 "Enhancer Detailed Experiment Results",
@@ -726,9 +761,9 @@ def create_dash_app(
             styles.append({
                 'if': {
                     'column_id':
-                    'Hyperparameters',
+                    'Prompt Variations',
                     'filter_query':
-                    f'{{Hyperparameters}} eq "{best_combination_str}"',
+                    f'{{Prompt Variations}} eq "{best_combination_str}"',
                 },
                 'backgroundColor': '#DFF0D8',  # Light green color
                 'border': '2px solid #28A745',  # Darker green border
@@ -742,11 +777,11 @@ def create_dash_app(
                     experiment_data.selection_output.selection_reason.items()
                 ])
                 tooltip_data = [{
-                    'Hyperparameters': {
+                    'Prompt Variations': {
                         'value': reason_str,
                         'type': 'markdown'
                     }
-                } if row["Hyperparameters"] == best_combination_str else {}
+                } if row["Prompt Variations"] == best_combination_str else {}
                                 for row in df.to_dict('records')]
 
         evaluator_names = [
@@ -781,12 +816,12 @@ def create_dash_app(
             },
             style_cell_conditional=[{
                 'if': {
-                    'column_id': 'Hyperparameters'
+                    'column_id': 'Prompt Variations'
                 },
                 'width': '40%'
             }, {
                 'if': {
-                    'column_id': 'Average Token Usage'
+                    'column_id': 'Average Token Usage(Cost Proportional)'
                 },
                 'width': '20%'
             }, {
@@ -989,8 +1024,9 @@ def create_dash_app(
         if highlight_key:
             styles_data_conditional.append({
                 'if': {
-                    'column_id': 'Hyperparameters',
-                    'filter_query': f'{{Hyperparameters}} eq "{highlight_key}"'
+                    'column_id': 'Prompt Variations',
+                    'filter_query':
+                    f'{{Prompt Variations}} eq "{highlight_key}"'
                 },
                 'backgroundColor': '#FFCCCC'  # Highlighting with gold color
             })
@@ -1267,6 +1303,8 @@ def create_dash_app(
         ])
 
     def use_best_result_layout():
+        if not experiment_data.combination_aggregated_metrics:
+            return html.Div([html.H3("No Experiment Result data available.")])
         if experiment_data.enhancer_output:
             best_combination = experiment_data.enhancer_output.selection_output.best_combination
         elif experiment_data.selection_output:
@@ -1296,7 +1334,7 @@ def create_dash_app(
                                         ),
                                         dbc.Col(
                                             dbc.Input(
-                                                id=f"input-{key}",
+                                                id=f"best-input-{key}",
                                                 type=value,
                                                 placeholder=key
                                             ),
@@ -1609,14 +1647,205 @@ def create_dash_app(
             }
         )
 
+    def input_task_layout():
+        if demo != True:
+            return html.Div([
+                html.Label(
+                    '[?] Please enter the name of the experiment: ',
+                    style={'margin': '10px'}
+                ),
+                dcc.Input(
+                    id='task',
+                    type='text',
+                    placeholder='Task',
+                    value=default_task,
+                    style={
+                        'width': '100%',
+                        'height': '50px',
+                        'fontSize': '18px',
+                        'margin': '10px'
+                    }
+                ),
+                html.Label(
+                    '[?] Please enter the prompt (use {{}} to wrap around input variables): ',
+                    style={'margin': '10px'}
+                ),
+                dcc.Input(
+                    id='context_info',
+                    type='text',
+                    placeholder='Context Info',
+                    value=default_context_info,
+                    style={
+                        'width': '100%',
+                        'height': '50px',
+                        'fontSize': '18px',
+                        'margin': '10px'
+                    }
+                ),
+                html.Label(
+                    '[?] Please provide evaluation aspects (optional):',
+                    style={'margin': '10px'}
+                ),
+                dcc.Input(
+                    id='evaluation_aspects',
+                    type='text',
+                    placeholder='Evaluation Aspects (optional)',
+                    value=default_evaluation_aspects,
+                    style={
+                        'width': '100%',
+                        'height': '50px',
+                        'fontSize': '18px',
+                        'margin': '10px'
+                    }
+                ),
+                html.Button(
+                    'Submit',
+                    id='submit-button',
+                    n_clicks=0,
+                    style={
+                        'fontSize': '18px',
+                        'margin': '10px'
+                    }
+                ),
+                html.Div(id='output-task-div')
+            ],
+                            style={
+                                'backgroundColor': '#f0f0f0',
+                                'padding': '20px'
+                            })
+        else:
+            return html.Div([
+                html.Div([
+                    html.Div([
+                        html.Button(
+                            'Tiktok Headline Generation Bot',
+                            id='update-button-1',
+                            n_clicks=0,
+                            className='task-button',
+                        ),
+                        html.Button(
+                            'Email Auto Reply Bot',
+                            id='update-button-2',
+                            n_clicks=0,
+                            className='task-button',
+                        ),
+                        html.Button(
+                            'Fitness Plan Bot',
+                            id='update-button-3',
+                            n_clicks=0,
+                            className='task-button',
+                        )
+                    ]),
+                    html.Div([
+                        html.Label(
+                            '[?] Please enter the name of the experiment:',
+                            style={'margin': '10px'}
+                        ),
+                        dcc.Input(
+                            id='task',
+                            type='text',
+                            placeholder='Task',
+                            value='',
+                            style={
+                                'width': '100%',
+                                'height': '50px',
+                                'fontSize': '18px',
+                                'margin': '10px'
+                            }
+                        ),
+                        html.Label(
+                            '[?] Please enter the prompt (use {{}} to wrap around input variables): ',
+                            style={'margin': '10px'}
+                        ),
+                        dcc.Input(
+                            id='context_info',
+                            type='text',
+                            placeholder='Context Info',
+                            value='',
+                            style={
+                                'width': '100%',
+                                'height': '50px',
+                                'fontSize': '18px',
+                                'margin': '10px'
+                            }
+                        ),
+                        html.Label(
+                            '[?] Please provide evaluation aspects (optional):',
+                            style={'margin': '10px'}
+                        ),
+                        dcc.Input(
+                            id='evaluation_aspects',
+                            type='text',
+                            placeholder='Evaluation Aspects (optional)',
+                            value='',
+                            style={
+                                'width': '100%',
+                                'height': '50px',
+                                'fontSize': '18px',
+                                'margin': '10px'
+                            }
+                        )
+                    ]),
+                    html.A(
+                        id='open-result-tab',
+                        target='_blank',
+                        children=[
+                            html.Button(
+                                'Open result page',
+                                id='open-result-tab-button',
+                                className='jump-button jump-button-show'
+                            )
+                        ]
+                    ),
+                    html.Div(id='output-task-div')
+                ],
+                         style={
+                             'backgroundColor': '#f0f0f0',
+                             'padding': '20px'
+                         })
+            ])
+
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 
     app.config.suppress_callback_exceptions = True
 
-    df = generate_combo_metrics_data(
-        experiment_data.combination_aggregated_metrics,
-        experiment_data.group_experiment_results
+    if not autogen:
+        df = generate_combo_metrics_data(
+            experiment_data.combination_aggregated_metrics,
+            experiment_data.group_experiment_results
+        )
+
+    @app.callback(
+        Output('open-result-tab', 'href'),
+        Input('task', 'value'),
     )
+    def update_link(task):
+        if task == 'Tiktok Headline Generation Bot':
+            return 'http://ec2-35-85-28-134.us-west-2.compute.amazonaws.com:8074/enhancer-experiment-results'
+        elif task == 'Email Auto Reply Bot':
+            return 'http://ec2-35-85-28-134.us-west-2.compute.amazonaws.com:8004/enhancer-experiment-results'
+        elif task == 'Fitness Plan Bot':
+            return 'http://ec2-35-85-28-134.us-west-2.compute.amazonaws.com:8003/enhancer-experiment-results'
+        else:
+            return dash.no_update
+
+    @app.callback(
+        Output('task', 'value'),
+        Output('context_info', 'value'),
+        Output('evaluation_aspects', 'value'),
+        Input('update-button-1', 'n_clicks'),
+        Input('update-button-2', 'n_clicks'),
+        Input('update-button-3', 'n_clicks'),
+    )
+    def update_input_values(n1, n2, n3):
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            return dash.no_update, dash.no_update, dash.no_update
+        else:
+            button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+        input_values = DefaultValueProvider.get_default_values(button_id)
+        return input_values.task, input_values.context_info, input_values.evaluation_aspects
 
     @app.callback(
         dash.dependencies.Output('page-content', 'children'),
@@ -1644,8 +1873,15 @@ def create_dash_app(
             return use_best_result_layout()
         elif pathname == '/data-analysis':
             return data_analysis_layout()
+        elif pathname == '/create-task':
+            return input_task_layout()
         else:
-            return index_page()
+            if autogen:
+                return input_task_layout()
+            elif enhance_page:
+                return enhancer_experiment_results_layout()
+            else:
+                return index_page()
 
     @app.callback(
         Output('comparative-scatter-plot-token', 'figure'),
@@ -1657,10 +1893,10 @@ def create_dash_app(
             return fig
         return px.scatter(
             df,
-            x='Average Token Usage',
+            x='Average Token Usage(Cost Proportional)',
             y=selected_evaluator,
             title=
-            f'Comparative Scatter plot of Average Token Usage vs {selected_evaluator}',
+            f'Comparative Scatter plot of Average Token Usage(Cost Proportional) vs {selected_evaluator}',
             size_max=15
         )
 
@@ -1720,7 +1956,7 @@ def create_dash_app(
 
             # Ensure 'Average Token Usage' is also numerical
             temp_avg_token_usage = pd.to_numeric(
-                df['Average Token Usage'], errors='coerce'
+                df['Average Token Usage(Cost Proportional)'], errors='coerce'
             )
 
             # Check if the columns exist and are not null, and if their lengths match
@@ -1728,7 +1964,7 @@ def create_dash_app(
                 temp_avg_token_usage
             ) == len(temp_evaluator_data):
                 correlation = temp_avg_token_usage.corr(temp_evaluator_data)
-                return f"Correlation between Average Token Usage and {selected_evaluator}: {correlation:.2f}"
+                return f"Correlation between Average Token Usage(Cost Proportional) and {selected_evaluator}: {correlation:.2f}"
             else:
                 return "Data not available for correlation calculation."
 
@@ -1879,6 +2115,7 @@ def create_dash_app(
         return dash.no_update
 
     all_results: List[html.Div] = []
+    best_all_results: List[html.Div] = []
 
     @app.callback(
         Output("results-section", "children"),
@@ -1927,6 +2164,10 @@ def create_dash_app(
                 if input_values[i] is not None:
                     content[k] = input_values[i]
             i += 1
+
+        if experiment_config["custom_function"
+                             ] == "demo.complete_task.complete_task":
+            content["task"] = selected_combinations[0]['task']
         input_data = InputData(
             content=content, expected_result=expected_result
         )
@@ -2043,7 +2284,7 @@ def create_dash_app(
         Output("best-results-section", "children"),
         Input("best-result-btn", "n_clicks"),
         [
-            State(f"input-{key}", "value")
+            State(f"best-input-{key}", "value")
             for key in list(function_args.keys())[:-1]
         ] + [State("best-combination", "children")],
         prevent_initial_call=True
@@ -2072,13 +2313,27 @@ def create_dash_app(
         for key in best_varation:
             best_varation[key] = [best_varation[key]]
         state.current_variations = best_varation
-        res = call_function_from_string(
-            experiment_config["custom_function"],  # type: ignore
-            **input_data.content,
-            state=state
-        ) if "custom_function" in experiment_config else None  #type: ignore
 
-        current_result = [
+        if "custom_function" in experiment_config:
+            if experiment_config["custom_function"
+                                 ] == "demo.complete_task.complete_task":
+                additional_data = {'task': best_combination}
+                content = {**input_data.content, **additional_data}
+                res = call_function_from_string(
+                    experiment_config["custom_function"],
+                    **content,
+                    state=state
+                )
+            else:
+                res = call_function_from_string(
+                    experiment_config["custom_function"],
+                    **input_data.content,
+                    state=state
+                )
+        else:
+            res = None
+
+        best_current_result = [
             html.Div([
                 html.Ul([
                     html.Li("Text Raw Output:"),
@@ -2101,7 +2356,7 @@ def create_dash_app(
         ])
         toggle_id = {"type": "toggle", "index": n_clicks}
         collapse_id = {"type": "collapse", "index": n_clicks}
-        current_result_card = html.Div([
+        best_current_result_card = html.Div([
             dbc.Button(
                 input_summary,
                 id=toggle_id,
@@ -2110,16 +2365,16 @@ def create_dash_app(
             ),
             dbc.Collapse([
                 item for sublist in [[res, html.Hr()]
-                                     for res in current_result]
+                                     for res in best_current_result]
                 for item in sublist
             ],
                          id=collapse_id,
                          is_open=True)
         ],
-                                       className="mb-3")
+                                            className="mb-3")
 
-        all_results.insert(0, current_result_card)
-        return all_results
+        best_all_results.insert(0, best_current_result_card)
+        return best_all_results
 
     def truncate_text(text, max_length=60):  # Adjust max_length as needed
         """Truncate text to a specified length and append ellipses."""
@@ -2175,6 +2430,52 @@ def create_dash_app(
     def toggle_collapse(n, is_open):
         return not is_open
 
+    @app.callback(
+        Output('output-task-div', 'children'),
+        [Input('submit-button', 'n_clicks')], [
+            State('task', 'value'),
+            State('context_info', 'value'),
+            State('evaluation_aspects', 'value')
+        ]
+    )
+    def update_task_output(n_clicks, task, context_info, evaluation_aspects):
+        if n_clicks > 0:
+            name = task
+            prompt_input = context_info
+            aspects = evaluation_aspects.split(","
+                                               ) if evaluation_aspects else []
+
+            if task != default_task or context_info != default_context_info or evaluation_aspects != default_evaluation_aspects:
+                asyncio.run(auto_generate_config(prompt_input, aspects))
+                print(
+                    colored(
+                        "\n[INFO][auto_gen] Generating configuration...",
+                        "yellow"
+                    )
+                )
+                subprocess.run([
+                    "yival", "run", "auto_generated_config.yaml",
+                    f"--output_path={name}.pkl", "--enhance_page"
+                ])
+            else:
+                print(
+                    colored(
+                        "\n[INFO][auto_gen] Using default configuration...",
+                        "yellow"
+                    )
+                )
+                subprocess.run([
+                    "yival", "run", "default_auto_generated_config.yaml",
+                    "--output_path=default_auto_generated.pkl",
+                    "--enhance_page"
+                ])
+
+            return 'Configuration generated and yival run completed.'
+
+    default_task = "Tiktok Headline Generation Bot"
+    default_context_info = "generate a short tiktok video title based on the {{content summary}} and {{target_audience}}"
+    default_evaluation_aspects = "emoji, oneline"
+
     app.layout = html.Div(
         [
             html.Div(
@@ -2225,8 +2526,16 @@ def create_dash_app(
         ],
         className="main-wrapper"
     )
-
     return app
+
+
+def find_available_port(start_port):
+    port = start_port
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('localhost', port)) != 0:
+                return port
+            port += 1
 
 
 def display_results_dash(
@@ -2236,26 +2545,40 @@ def display_results_dash(
     state,
     logger,
     evaluator,
+    enhance_page=False,
     interactive=False,
-    port=8074
+    autogen=False,
+    demo=False,
+    port=8074,
 ):
-    if experiment_data.enhancer_output:
-        for group_result in experiment_data.enhancer_output.group_experiment_results:
-            experiment_results = []
-            seen = set()
-            for r in group_result.experiment_results:
-                if str(r.combination) in seen:
-                    continue
-                else:
-                    seen.add(str(r.combination))
-                    experiment_results.append(r)
-            group_result.experiment_results = experiment_results
-    function_args = get_function_args(experiment_config["custom_function"])
-    function_args["yival_expected_result (Optional)"] = 'str'
-    app = create_dash_app(
-        experiment_data, experiment_config, function_args, all_combinations,
-        state, logger, evaluator, interactive
-    )
+    port = find_available_port(port)
+
+    if not autogen:
+        if experiment_data.enhancer_output:
+            for group_result in experiment_data.enhancer_output.group_experiment_results:
+                experiment_results = []
+                seen = set()
+                for r in group_result.experiment_results:
+                    if str(r.combination) in seen:
+                        continue
+                    else:
+                        seen.add(str(r.combination))
+                        experiment_results.append(r)
+                group_result.experiment_results = experiment_results
+        function_args = get_function_args(
+            experiment_config["custom_function"], experiment_config["dataset"]
+        )
+        function_args["yival_expected_result (Optional)"] = 'str'
+        app = create_dash_app(
+            experiment_data, experiment_config, function_args,
+            all_combinations, state, logger, evaluator, interactive, autogen,
+            demo, enhance_page
+        )
+    else:
+        app = create_dash_app(
+            experiment_data, experiment_config, {}, all_combinations, state,
+            logger, evaluator, interactive, autogen, demo, enhance_page
+        )
     if os.environ.get("ngrok", False):
         public_url = ngrok.connect(port)
         print(f"Access Yival from this public URL :{public_url}")

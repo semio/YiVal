@@ -1,9 +1,16 @@
 import argparse
+import asyncio
+import re
 import subprocess
 
 from termcolor import colored
 
+from yival import logger
 from yival.common.auto_cofig_utils import auto_generate_config
+from yival.experiment import evaluator
+from yival.experiment.app.app import display_results_dash  # type: ignore
+from yival.schemas.experiment_config import Experiment
+from yival.states.experiment_state import ExperimentState
 
 try:
     import inquirer
@@ -18,7 +25,43 @@ except ImportError:
 
 
 def format_input(input_str):
-    return input_str.replace(" ", "_")
+    # Identify variables annotated with {} and replace spaces with underscores
+    formatted = re.sub(
+        r'\{([^}]*)\}', lambda m: m.group(1).replace(" ", "_"), input_str
+    )
+    return formatted
+
+
+def run_auto_gen():
+    display_results_dash(
+        Experiment([], []),
+        None, [],
+        ExperimentState.get_instance(),
+        logger,
+        evaluator,
+        False,
+        True,
+        True,
+        False,
+        port=8050
+    )
+    print(colored("\nProcess completed!", "green"))
+
+
+def run_demo():
+    display_results_dash(
+        Experiment([], []),
+        None, [],
+        ExperimentState.get_instance(),
+        logger,
+        evaluator,
+        False,
+        True,
+        True,
+        True,
+        port=8050
+    )
+    print(colored("\nProcess completed!", "green"))
 
 
 def main():
@@ -27,33 +70,26 @@ def main():
     )
     parser.parse_args()
 
-    questions = [
-        inquirer.Text('task', message="What task would you like to set up?"),
-        inquirer.Text(
-            'context_info',
-            message=
-            "Provide input for the task, separated by comma. For example: 'team' or 'project'."
-        ),
-        inquirer.Text(
-            'evaluation_aspects',
-            message="Please provide evaluation aspects (optional)"
-        ),
-    ]
+    name = input("Please enter the name of the experiment: ")
+    # Directly read the prompt and evaluation aspects using input()
+    prompt_input = input(
+        "Please enter the prompt (use {{}} to wrap around input variables): "
+    )
+    evaluation_aspects_input = input(
+        "Please provide evaluation aspects (optional): "
+    )
 
-    answers = inquirer.prompt(questions)
+    aspects = evaluation_aspects_input.split(
+        ","
+    ) if evaluation_aspects_input else []
 
-    parameters = answers['context_info'].split(",")
-    aspect = []
-    if answers['evaluation_aspects']:
-        aspect = answers['evaluation_aspects'].split(",")
-
-    auto_generate_config(answers['task'], parameters, aspect)
+    asyncio.run(auto_generate_config(prompt_input, aspects))
 
     print(colored("\nGenerating configuration...", "yellow"))
 
     subprocess.run([
         "yival", "run", "auto_generated_config.yaml",
-        "--output_path=auto_generated.pkl"
+        f"--output_path={name}.pkl", "--enhance_page"
     ])
 
     print(colored("\nProcess completed!", "green"))
